@@ -49,7 +49,7 @@
                  (1- base)
                  (1+ base))))
     (setf (aref vector x) y)
-    (loop for x = from (1+ x0) to (1- x1)
+    (loop for x from (1+ x0) to (1- x1)
           do (incf err (abs y-delta))
           (if (>= err x-delta)
               (progn (decf err x-delta)
@@ -222,7 +222,7 @@
              (let ((last 0)
                    (value-vector (make-array dimensions)))
                (loop for i below dimensions
-                     for offset = (* lookup-offset dimensions) then (1+ offset)
+                     for offset from (* lookup-offset dimensions)
                      do (setf (aref value-vector i)
                               (* (aref vector offset) (+ min delta last)))
                      (when sequencep
@@ -346,12 +346,48 @@
                (go step2))
              result))))))
 
-(define-binary-class floor-one ()
-  ((floor-one-partitions (n-bits :n 5))
-   ))
+(defun read-floor-one (stream)
+  ;; header decode
+  ;; see section 7.2.2 of the spec
+  (loop with partitions = (read-n-bits 5 stream)
+        with partition-class-list = (make-array partitions)
+        for maximum-class = -1
+          then (loop for x across partition-class-list
+                     when (integerp x)
+                       maximize x)
+        for i below partitions
+        do (setf (aref partition-class-list i) (read-n-bits 4 stream))
+           (loop with class-dimensions = (make-array maximum-class)
+                 with subclasses = (make-array maximum-class)
+                 with masterbooks = (make-array maximum-class)
+                 for i below maximum-class
+                 do (setf (aref class-dimensions i) (1+ (read-n-bits 3 stream))
+                          (aref subclasses i) (read-n-bits 2 stream))
+                 when (plusp (aref subclasses i))
+                   do (setf (aref masterbooks i) (read-n-bits 8 stream))
+                      (loop with max = (1- (expt 2 (aref subclasses i)))
+                            with subclass-books
+                              = (make-array (list maximum-class max))
+                            for j below max
+                            do (setf (aref subclass-books i j)
+                                     (1- (read-n-bits 8 stream)))
+                               (loop with multiplier = (1+ (read-n-bits 2 stream))
+                                     with range = (read-n-bits 4 stream)
+                                     with x-list = (make-array 2 :adjustable t) ; TODO: dimensions?
+                                     for values from 2
+                                     initially (setf (aref x-list 0) 0
+                                                     (aref x-list 1) (expt 2 range))
+                                     for a below partitions
+                                     for current-class-number
+                                       = (aref partition-class-list a)
+                                     do (loop for b below
+                                                    (aref class-dimensions
+                                                          current-class-number)
+                                              do (setf (aref x-list values)
+                                                       (read-n-bits range stream))))))))
 
 (define-binary-type floor-configuration (length)
-x  (:reader (in)
+  (:reader (in)
            (let ((result (make-array length)))
              (loop for i below length
                    for floor-type = (read-value 'u2 in)
