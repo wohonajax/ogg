@@ -364,9 +364,12 @@
            (class-dimensions (make-array maximum-class))
            (masterbooks (make-array maximum-class))
            (subclasses (make-array maximum-class))
-           (max (1- (expt 2 (aref subclasses i))))
-           (subclass-books (make-array (list maximum-class max))))
+           (x-list)
+           (subclass-books))
       (loop for i below maximum-class
+            with max = (1- (expt 2 (aref subclasses i)))
+            initially
+               (setf subclass-books (make-array (list maximum-class max)))
             do (setf (aref class-dimensions i) (1+ (read-n-bits 3 stream))
                      (aref subclasses i)       (read-n-bits 2 stream))
                (loop for j below max
@@ -376,32 +379,47 @@
               do (setf (aref masterbooks i) (read-n-bits 8 stream)))
       (loop with multiplier = (1+ (read-n-bits 2 stream))
             with range = (read-n-bits 4 stream)
-            with x-list = (make-array 2 :adjustable t) ; TODO: dimensions?
             for values from 2
-            initially (setf (aref x-list 0) 0
-                            (aref x-list 1) (expt 2 range))
             for i below partitions
             for current-class-number = (aref partition-class-list i)
+            initially (setf x-list (make-array
+                                    (+ 2 (aref class-dimensions
+                                               current-class-number)))
+                            (aref x-list 0) 0
+                            (aref x-list 1) (expt 2 range))
             do (loop for j below (aref class-dimensions current-class-number)
                      do (setf (aref x-list values)
-                              (read-n-bits range stream)))))))
+                              (read-n-bits range stream)))
+            finally (return (values partitions
+                                    partition-class-list
+                                    class-dimensions
+                                    subclasses
+                                    subclass-books
+                                    masterbooks
+                                    multiplier
+                                    x-list
+                                    stream))))))
 
-(defun decode-floor1-packet (stream)
+(defun decode-floor1-packet (partitions partition-class-list class-dimensions
+                             subclasses subclass-books masterbooks multiplier
+                             x-list stream)
   ;; packet decode
   ;; see section 7.2.3 of the spec
   (if (read-bit stream)
-      (let* ((range (aref (vector 256 128 86 64) (1- multiplier)))
-             (class 0) (cdim 0) (cbits 0) (csub 0) (cval 0) (book 0))
+      (let ((range (aref (vector 256 128 86 64) (1- multiplier)))
+            (cval 0)
+            (book 0))
         (loop with y = (make-array 2 :adjustable t) ; TODO: dimensions?
               initially (setf (aref y 0) (read-n-bits (ilog (1- range)) stream)
                               (aref y 1) (read-n-bits (ilog (1- range)) stream))
               for offset = 2 then (+ offset cdim)
               for i below partitions
-              do (setf class (aref partition-class i)
-                       cdim  (aref class-dimensions class)
-                       cbits (aref subclasses class)
-                       csub  (expt 2 (1- cbits))
-                       cval  0)
+              ;; hope [floor1_partition_class] is supposed
+              ;; to be [floor1_partition_class_list]
+              for class = (aref partition-class-list i)
+              for cdim = (aref class-dimensions class)
+              for cbits = (aref subclasses class)
+              for csub = (expt 2 (1- cbits))
               when (plusp cbits)
                 do (setf cval (read-n-bits (aref masterbooks class) stream))
               do (loop for j below cdim
@@ -410,7 +428,8 @@
                                            (logand cval csub))
                                 cval (ash cval (- cbits)))
                        if (not (minusp book))
-                         do (setf (aref y (+ j offset)) (read-n-bits book stream))
+                         do (setf (aref y (+ j offset))
+                                  (read-n-bits book stream))
                        if (minusp book)
                          do (setf (aref y (+ j offset)) 0))))
       :unused))
@@ -425,9 +444,10 @@
                       (setf (aref result i)
                             (cond ((zerop floor-type)
                                    (multiple-value-call #'compute-floor0-curve
-                                     (decode-floor0-header)))
+                                     (decode-floor0-header in)))
                                   ((= floor-type 1)
-                                   (decode-floor1-header))
+                                   (multiple-value-call #'decode-floor1-packet
+                                     (read-floor1-header in)))
                                   ((> floor-type 1)
                                    (error "Undecodable"))))
                    finally (return result))))
