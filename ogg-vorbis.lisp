@@ -119,6 +119,7 @@
    (vorbis-floor-configurations (floor-configuration :length
                                                      (incf vorbis-floor-count)))
    ))
+   
 
 (define-binary-class codebook ()
   ((sync-pattern u3)
@@ -172,12 +173,6 @@
                (read-unordered-codebook-entries length in)))
   (:writer (out value)))
 
-(defun lookup1-values (length dimensions)
-  (let ((r (floor (exp (/ (log length) dimensions)))))
-    (if (>= length (expt (1+ r) dimensions))
-        (1+ r)
-        r)))
-
 (defun unpack-float32 (x)
   (let ((mantissa (logand x #x1fffff))
         (sign (logand x #x80000000))
@@ -185,6 +180,12 @@
     (unless (zerop sign)
       (setf mantissa (- mantissa)))
     (* mantissa (expt 2 (- exponent 788)))))
+
+(defun lookup1-values (length dimensions)
+  (let ((r (floor (exp (/ (log length) dimensions)))))
+    (if (>= length (expt (1+ r) dimensions))
+        (1+ r)
+        r)))
 
 (defun read-lookup-values (type length dimensions stream)
   (let* ((min (unpack-float32 (read-value 'u4 stream)))
@@ -199,8 +200,8 @@
          ;; lookup-offset = the current entry number in this codebook
          ;; one problem is that codebook-entries are a single vector
          ;; and aren't split into separate entries
-         ;; see section 3.2 of the spec
-         (lookup-offset)
+         ;; see sections 3.2/3.3 of the spec
+         (lookup-offset 0)
          (result (make-array size)))
     (loop for i below size
           do (setf (aref result i)
@@ -226,8 +227,8 @@
                               (* (aref vector offset) (+ min delta last)))
                         (when sequencep
                           (setf last (aref value-vector i))))
-               value-vector)))
-      result)))
+               value-vector))))
+    result))
 
 (define-binary-type lookup (type length dimensions)
   (:reader (in)
@@ -237,35 +238,24 @@
               (read-lookup-values type length dimensions in))))
   (:writer (out value)))
 
-(define-binary-class floor0-header ()
-  ((floor0-order u1)
-   (floor0-rate u2)
-   (floor0-bark-mapsize u2)
-   (floor0-amplitude-bits (n-bits :n 6))
-   (floor0-amplitude-offset u1)
-   (floor0-number-of-books (n-bits :n 4))
-   (floor0-book-list (n-things :length (incf floor0-number-of-books)
-                               :thing 'u1))))
-
-(defun decode-floor0-packet (floor0-header stream)
-  (let ((amplitude (read-n-bits (floor0-amplitude-bits floor0-header)
-                                stream)))
+(defun decode-floor0-header (stream)
+  (let* ((order (read-value 'u1 stream))
+         (rate (read-value 'u2 stream))
+         (bark-mapsize (read-value 'u2 stream))
+         (amplitude-bits (read-n-bits 6 stream))
+         (amplitude-offset (read-value 'u1 stream))
+         (number-of-books (1+ (read-n-bits 4 stream)))
+         (book-list (loop for i below number-of-books
+                          collect (read-value 'u1 stream)))
+         (amplitude (read-n-bits amplitude-bits stream)))
     (if (plusp amplitude)
         (let ((coefficients (make-array 0))
-              (booknumber (read-n-bits
-                           (ilog (floor0-number-of-books floor0-header))
-                           stream))
-              (last 0)
-              (book-list (floor0-book-list floor0-header)))
+              (booknumber (read-n-bits (ilog number-of-books) stream)))
           (if (> booknumber (reduce #'max book-list))
               (error "Undecodable")
-              (loop for coefficients-length = (length coefficients)
-                    for last = 0
-                      then (if (zerop coefficients-length)
-                               0
-                               (aref coefficients (1- coefficients-length)))
-                    while (< coefficients-length
-                             (floor0-order floor-zero))
+              (loop with last = 0
+                    for coefficients-length = (length coefficients)
+                    while (< coefficients-length order)
                     for temp-vector
                     ;; FIXME: see section 6.2.2 of the spec
                     ;; we need to read a vector from STREAM
@@ -273,132 +263,172 @@
                     ;; element [booknumber] in VQ context"
                       = (read-value 'vector stream
                                     :length (nth booknumber book-list))
-                    do (setf coefficients
+                    do (loop for i across temp-vector
+                             for j from 0
+                             with new-temp-vector
+                               = (make-array (length temp-vector))
+                             do (setf (aref new-temp-vector j) (+ i last))
+                             finally (setf last (aref temp-vector j)
+                                           temp-vector new-temp-vector))
+                       (setf coefficients
                              (concatenate 'vector coefficients temp-vector))
-                    finally (return (values amplitude coefficients))))
-          :unused))))
+                    finally (return (values coefficients
+                                            amplitude
+                                            order
+                                            rate
+                                            bark-mapsize
+                                            amplitude-bits
+                                            amplitude-offset
+                                            nil))))
+          (values nil nil order nil nil nil nil t)))))
 
 (defun product (init n fn &rest args)
+  ;; (loop for j from init upto n
+  ;;       collect (apply fn j args) into result
+  ;;       finally (reduce #'* result))
   (loop for j from init upto n
-        collect (apply fn j args) into result
-        finally (reduce #'* result)))
+        for result = (apply fn j args)
+          then (* result (apply fn j args))
+        finally (return result)))
 
-(defun compute-floor0-curve (floor0 amplitude coefficients n)
-  (flet ((bark (x)
+(defun compute-floor0-curve (coefficients amplitude order rate
+                             mapsize amp-bits amp-offset unused-p)
+  (if unused-p
+      (make-array order :initial-element 0)
+      (flet ((bark (x)
                (+ (* 13.1 (atan (* .00074 x)))
                   (* 2.24 (atan (* .0000000185 x x)))
                   (* .0001 x)))
-         (p-fn (j omega)
+             (p-fn (j omega)
                (* 4 (expt (- (cos (aref coefficients (1+ (* 2 j))))
                              (cos omega))
                           2)))
-         (q-fn (j omega)
+             (q-fn (j omega)
                (* 4 (expt (- (cos (aref coefficients (* 2 j)))
                              (cos omega))
                           2))))
-    (let* ((map-size (floor0-bark-mapsize floor0))
-           (rate (floor0-rate floor0))
-           (order (floor0-order floor0))
-           (amp-offset (floor0-amplitude-offset floor0))
-           (amp-bits (floor0-amplitude-bits floor0))
-
-           (map (loop for i from 0 upto n
-                      with foobar = (* (bark (/ (* i rate)
-                                                (* 2 n)))
-                                       (/ map-size
-                                          (bark (* .5 rate))))
-                      collect (if (= i n)
-                                  -1
-                                  (min (1- map-size) foobar))))
-
-           (i 0)
-           (omega 0)
-           (p 0)
-           (q 0)
-           linear-floor-value
-           iteration-condition
-           (result (make-array n)))
-      (tagbody step2 (setf omega (* pi (nth i map)))
-         (if (oddp order)
-             (setf p (* (- 1 (expt (cos omega) 2))
-                        (product (/ (- order 3) 2)
-                                 #'p-fn omega))
-                   q (* (/ 4) (product (/ (1- order) 2)
-                                       #'q-fn omega)))
-             (setf p (* (/ (- 1 (cos omega)) 2)
-                        (product (/ (- order 2) 2)
-                                 #'p-fn omega))
-                   q (* (/ (1+ (cos omega)) 2)
-                        (product (/ (- order 2) 2)
-                                 #'q-fn omega))))
-         (setf linear-floor-value
-               (exp (* .11512925
-                       (- (/ (* amplitude amp-offset)
-                             (* (1- (expt 2 amp-bits))
-                                (sqrt (+ p q))))
-                          amp-offset))))
-       step5 (setf iteration-condition (nth i map))
-         (setf (aref result i) linear-floor-value)
-         (incf i)
-         (when (= (nth i map) iteration-condition)
-           (go step5))
-         (when (< i n)
-           (go step2))
-       result))))
+        (let ((map (loop for i from 0 upto n
+                         with foobar = (* (bark (/ (* i rate)
+                                                   (* 2 n)))
+                                          (/ map-size
+                                             (bark (* .5 rate))))
+                         collect (if (= i n)
+                                     -1
+                                     (min (1- map-size) foobar))))
+              (i 0)
+              (omega 0)
+              (p 0)
+              (q 0)
+              linear-floor-value
+              iteration-condition
+              (result (make-array order)))
+          (tagbody step2 (setf omega (* pi (nth i map)))
+             (if (oddp order)
+                 (setf p (* (- 1 (expt (cos omega) 2))
+                            (product (/ (- order 3) 2)
+                                     #'p-fn omega))
+                       q (* (/ 4) (product (/ (1- order) 2)
+                                           #'q-fn omega)))
+                 (setf p (* (/ (- 1 (cos omega)) 2)
+                            (product (/ (- order 2) 2)
+                                     #'p-fn omega))
+                       q (* (/ (1+ (cos omega)) 2)
+                            (product (/ (- order 2) 2)
+                                     #'q-fn omega))))
+             (setf linear-floor-value
+                   (exp (* .11512925
+                           (- (/ (* amplitude amp-offset)
+                                 (* (1- (expt 2 amp-bits))
+                                    (sqrt (+ p q))))
+                              amp-offset))))
+           step5 (setf iteration-condition (nth i map))
+             (setf (aref result i) linear-floor-value)
+             (incf i)
+             (when (= (nth i map) iteration-condition)
+               (go step5))
+             (when (< i n)
+               (go step2))
+           result)))))
 
 (defun read-floor1-header (stream)
   ;; header decode
   ;; see section 7.2.2 of the spec
-  (loop with partitions = (read-n-bits 5 stream)
-        with partition-class-list = (make-array partitions)
-        for maximum-class = -1
-          then (loop for x across partition-class-list
-                     when (integerp x)
-                       maximize x)
-        for i below partitions
-        do (setf (aref partition-class-list i) (read-n-bits 4 stream))
-           (loop with class-dimensions = (make-array maximum-class)
-                 with subclasses = (make-array maximum-class)
-                 with masterbooks = (make-array maximum-class)
-                 for i below maximum-class
-                 do (setf (aref class-dimensions i) (1+ (read-n-bits 3 stream))
-                          (aref subclasses i)       (read-n-bits 2 stream))
-                 when (plusp (aref subclasses i))
-                   do (setf (aref masterbooks i) (read-n-bits 8 stream))
-                      (loop with max = (1- (expt 2 (aref subclasses i)))
-                            with subclass-books
-                              = (make-array (list maximum-class max))
-                            for j below max
-                            do (setf (aref subclass-books i j)
-                                     (1- (read-n-bits 8 stream)))
-                               (loop with multiplier = (1+ (read-n-bits 2 stream))
-                                     with range = (read-n-bits 4 stream)
-                                     with x-list = (make-array 2 :adjustable t) ; TODO: dimensions?
-                                     for values from 2
-                                     initially (setf (aref x-list 0) 0
-                                                     (aref x-list 1) (expt 2 range))
-                                     for a below partitions
-                                     for current-class-number
-                                       = (aref partition-class-list a)
-                                     do (loop for b below
-                                                    (aref class-dimensions
-                                                          current-class-number)
-                                              do (setf (aref x-list values)
-                                                       (read-n-bits range stream))))))))
+  (let* ((partitions (read-n-bits 5 stream))
+         (partition-class-list (make-array partitions)))
+    (loop for i below partitions
+          do (setf (aref partition-class-list i)
+                   (read-n-bits 4 stream)))
+    (let* ((maximum-class (loop for x across partition-class-list
+                                when (integerp x)
+                                  maximize x))
+           (class-dimensions (make-array maximum-class))
+           (masterbooks (make-array maximum-class))
+           (subclasses (make-array maximum-class))
+           (max (1- (expt 2 (aref subclasses i))))
+           (subclass-books (make-array (list maximum-class max))))
+      (loop for i below maximum-class
+            do (setf (aref class-dimensions i) (1+ (read-n-bits 3 stream))
+                     (aref subclasses i)       (read-n-bits 2 stream))
+               (loop for j below max
+                     do (setf (aref subclass-books i j)
+                              (1- (read-n-bits 8 stream))))
+            if (not (zerop (aref subclasses i)))
+              do (setf (aref masterbooks i) (read-n-bits 8 stream)))
+      (loop with multiplier = (1+ (read-n-bits 2 stream))
+            with range = (read-n-bits 4 stream)
+            with x-list = (make-array 2 :adjustable t) ; TODO: dimensions?
+            for values from 2
+            initially (setf (aref x-list 0) 0
+                            (aref x-list 1) (expt 2 range))
+            for i below partitions
+            for current-class-number = (aref partition-class-list i)
+            do (loop for j below (aref class-dimensions current-class-number)
+                     do (setf (aref x-list values)
+                              (read-n-bits range stream)))))))
+
+(defun decode-floor1-packet (stream)
+  ;; packet decode
+  ;; see section 7.2.3 of the spec
+  (if (read-bit stream)
+      (let* ((range (aref (vector 256 128 86 64) (1- multiplier)))
+             (class 0) (cdim 0) (cbits 0) (csub 0) (cval 0) (book 0))
+        (loop with y = (make-array 2 :adjustable t) ; TODO: dimensions?
+              initially (setf (aref y 0) (read-n-bits (ilog (1- range)) stream)
+                              (aref y 1) (read-n-bits (ilog (1- range)) stream))
+              for offset = 2 then (+ offset cdim)
+              for i below partitions
+              do (setf class (aref partition-class i)
+                       cdim  (aref class-dimensions class)
+                       cbits (aref subclasses class)
+                       csub  (expt 2 (1- cbits))
+                       cval  0)
+              when (plusp cbits)
+                do (setf cval (read-n-bits (aref masterbooks class) stream))
+              do (loop for j below cdim
+                       do (setf book (aref subclass-books
+                                           class
+                                           (logand cval csub))
+                                cval (ash cval (- cbits)))
+                       if (not (minusp book))
+                         do (setf (aref y (+ j offset)) (read-n-bits book stream))
+                       if (minusp book)
+                         do (setf (aref y (+ j offset)) 0))))
+      :unused))
 
 (define-binary-type floor-configuration (length)
   (:reader (in)
-           (let ((result (make-array length)))
+           (let ((types (make-array length))
+                 (result (make-array length)))
              (loop for i below length
                    for floor-type = (read-value 'u2 in)
-                     then (read-value 'u2 in)
-                   do (setf (aref result i)
+                   do (setf (aref types i) floor-type)
+                      (setf (aref result i)
                             (cond ((zerop floor-type)
-                                   (compute-floor0-curve
-                                    (decode-floor0-packet)))
+                                   (multiple-value-call #'compute-floor0-curve
+                                     (decode-floor0-header)))
                                   ((= floor-type 1)
-                                   (decode-floor1-packet))
+                                   (decode-floor1-header))
                                   ((> floor-type 1)
-                                   (error "Can't happen"))))
+                                   (error "Undecodable"))))
                    finally (return result))))
   (:writer (out value)))
